@@ -154,7 +154,7 @@ def resolve_credentials(args):
     url = getattr(args, "url", None) or os.environ.get("OP_URL") or cfg.get("url")
     token = getattr(args, "token", None) or os.environ.get("OP_TOKEN") or cfg.get("token")
     if not url or not token:
-        die("not configured yet", hint="Run:  op init")
+        die("not configured yet", hint="Run:  op setup")
     return url.rstrip("/"), token
 
 
@@ -286,7 +286,7 @@ class Client:
         msg = error_text(parsed)
         hint = None
         if code == 401:
-            hint = "Token rejected. Re-run: op init"
+            hint = "Token rejected. Re-run: op setup"
         elif code == 403 and "time_entries" in url:
             # Time tracking lives in the "costs" module, which is enabled per
             # project. Admin rights do not bypass a disabled module.
@@ -566,35 +566,202 @@ def confirm(prompt):
 # commands
 # --------------------------------------------------------------------------
 
-def cmd_init(args):
+def ask(prompt, default=None, secret=False):
+    suffix = f" [{default}]" if default else ""
+    try:
+        answer = input(f"{prompt}{suffix}: ").strip()
+    except EOFError:
+        die("setup needs an interactive terminal",
+            hint="Non-interactive? Use: op setup --url URL --token TOKEN --project NAME --yes")
+    return answer or (default or "")
+
+
+def ask_yes(prompt, default=True, assume=False):
+    # --yes means "take the default", not "answer yes". Otherwise a prompt
+    # that defaults to no - such as "use this unreachable URL anyway?" -
+    # would be silently accepted in unattended mode.
+    if assume:
+        return default
+    hint = "Y/n" if default else "y/N"
+    try:
+        answer = input(f"{prompt} [{hint}]: ").strip().lower()
+    except EOFError:
+        return default
+    if not answer:
+        return default
+    return answer in ("y", "yes")
+
+
+def probe_instance(url):
+    """Confirm something OpenProject-shaped answers at this URL.
+
+    Unauthenticated /api/v3 replies 200 or 401 on a real instance; anything
+    else means the URL is wrong before we bother asking for a token.
+    """
+    try:
+        req = urllib.request.Request(url.rstrip("/") + "/api/v3", method="GET")
+        req.add_header("Accept", "application/json")
+        with urllib.request.urlopen(req, context=CTX, timeout=20) as r:
+            body = json.loads(r.read().decode("utf-8", "replace"))
+            return True, body.get("coreVersion")
+    except urllib.error.HTTPError as e:
+        return (e.code in (401, 403)), None
+    except Exception as e:
+        return False, str(e)
+
+
+def install_completion(shell, assume=False):
+    """Append a completion script to the user's shell profile, once."""
+    marker = "# >>> op completion >>>"
+    if shell == "powershell":
+        profile = Path(os.environ.get("USERPROFILE", Path.home())) / \
+            "Documents" / "PowerShell" / "Microsoft.PowerShell_profile.ps1"
+        script = PS_COMPLETION
+    else:
+        profile = Path.home() / ".bashrc"
+        script = BASH_COMPLETION
+
+    if profile.exists() and marker in profile.read_text(encoding="utf-8", errors="replace"):
+        print(f"  completion already present in {profile}")
+        return True
+    if not ask_yes(f"  Add tab completion to {profile}?", True, assume):
+        return False
+    try:
+        profile.parent.mkdir(parents=True, exist_ok=True)
+        with profile.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n{marker}\n{script}# <<< op completion <<<\n")
+        print(f"  added to {profile} (restart your shell to use it)")
+        return True
+    except OSError as e:
+        print(f"  could not write {profile}: {e}")
+        return False
+
+
+def add_to_path(directory, assume=False):
+    """Add a directory to the *user* PATH on Windows.
+
+    Uses the registry rather than setx, because setx silently truncates any
+    PATH longer than 1024 characters.
+    """
+    if os.name != "nt":
+        print(f"  add this to your PATH:  export PATH=\"{directory}:$PATH\"")
+        return False
+    try:
+        import winreg
+    except ImportError:
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0,
+                            winreg.KEY_READ | winreg.KEY_WRITE) as key:
+            try:
+                current, kind = winreg.QueryValueEx(key, "Path")
+            except FileNotFoundError:
+                current, kind = "", winreg.REG_EXPAND_SZ
+            entries = [p for p in current.split(";") if p]
+            if any(os.path.normcase(p.rstrip("\\")) ==
+                   os.path.normcase(str(directory).rstrip("\\")) for p in entries):
+                print("  already on your PATH")
+                return True
+            if not ask_yes(f"  Add {directory} to your user PATH?", True, assume):
+                return False
+            winreg.SetValueEx(key, "Path", 0, kind, ";".join(entries + [str(directory)]))
+        print("  added to your user PATH (open a new terminal to pick it up)")
+        return True
+    except OSError as e:
+        print(f"  could not update PATH: {e}")
+        return False
+
+
+def cmd_setup(args):
+    assume = getattr(args, "yes", False)
     cfg = load_config()
-    default_url = cfg.get("url") or os.environ.get("OP_URL") or ""
-    url = args.url or input(
-        f"OpenProject URL{f' [{default_url}]' if default_url else ''}: ").strip() or default_url
+    interactive = sys.stdin.isatty()
+
+    print(paint("op setup", C.BOLD))
+    print(paint("Press Enter to accept the value in brackets.\n", C.DIM))
+
+    # ---- 1. instance -----------------------------------------------------
+    print(paint("1. Which OpenProject instance?", C.BOLD))
+    current = cfg.get("url") or os.environ.get("OP_URL") or ""
+    url = args.url or (current if (assume or not interactive) else ask("   URL", current))
     if not url:
-        die("a URL is required")
+        die("a URL is required", hint="op setup --url https://openproject.example.com")
     if not url.startswith("http"):
         url = "https://" + url
     url = url.rstrip("/")
 
-    token = args.token
-    if not token:
-        note("")
-        note(f"Create a token at: {url}/my/access_token")
-        token = input("API token: ").strip()
+    ok, detail = probe_instance(url)
+    if not ok:
+        print(paint(f"   Could not reach an OpenProject API at {url}", C.RED))
+        if detail:
+            print(paint(f"   {detail}", C.DIM))
+        if not ask_yes("   Use it anyway?", False, assume):
+            die("setup cancelled", 0)
+    else:
+        print(paint(f"   OK  {url}" + (f"  (OpenProject {detail})" if detail else ""), C.GREEN))
+
+    # ---- 2. token --------------------------------------------------------
+    print("\n" + paint("2. API token", C.BOLD))
+    token = args.token or cfg.get("token") or os.environ.get("OP_TOKEN")
+    reuse = bool(token) and not args.token
+    if reuse and interactive and not assume:
+        reuse = ask_yes("   Keep the existing token?", True)
+    if not token or not reuse:
+        token_url = f"{url}/my/access_token"
+        print(f"   Create one at: {paint(token_url, C.CYAN)}")
+        if interactive and ask_yes("   Open that page now?", True, assume):
+            try:
+                webbrowser.open(token_url)
+            except Exception:
+                pass
+        token = args.token or ask("   Paste the token")
     if not token:
         die("a token is required")
 
     me = Client(url, token).get("/users/me")
+    print(paint(f"   OK  authenticated as {me.get('name')}"
+                + (" (admin)" if me.get("admin") else ""), C.GREEN))
+
     cfg.update({"url": url, "token": token})
     save_config(cfg)
     Cache.clear()
-    note("")
-    note(f"Saved to {CONFIG_PATH}")
-    print(f"Connected to {url} as {me.get('name')}" + (" (admin)" if me.get("admin") else ""))
-    note("")
-    note("Next:  op ls            list open work")
-    note("       op config set --project <name>   so you can stop typing --project")
+
+    # ---- 3. default project ---------------------------------------------
+    print("\n" + paint("3. Default project", C.BOLD))
+    print(paint("   Sets the project used by ls, new, stats and types.", C.DIM))
+    chosen = args.project
+    if chosen is None and (interactive and not assume):
+        client = Client(url, token)
+        projects = client.collect("/projects", limit=50)
+        if projects:
+            for i, p in enumerate(projects, 1):
+                print(f"   {str(i).rjust(2)}. {p.get('name')}  "
+                      + paint(f"({p.get('identifier')})", C.DIM))
+            print(f"   {' 0'}. none - always pass --project")
+            pick = ask("   Choose a number", "0")
+            if pick.isdigit() and 1 <= int(pick) <= len(projects):
+                chosen = projects[int(pick) - 1].get("identifier")
+    if chosen:
+        cfg["defaultProject"] = chosen
+        save_config(cfg)
+        print(paint(f"   OK  default project: {chosen}", C.GREEN))
+    else:
+        print(paint("   skipped", C.DIM))
+
+    # ---- 4. shell integration -------------------------------------------
+    if not getattr(args, "skip_shell", False):
+        print("\n" + paint("4. Shell integration", C.BOLD))
+        here = Path(__file__).resolve().parent
+        add_to_path(here, assume)
+        install_completion("powershell" if os.name == "nt" else "bash", assume)
+
+    # ---- done ------------------------------------------------------------
+    print("\n" + paint("Done.", C.GREEN) + f"  Settings saved to {CONFIG_PATH}")
+    print("\nTry:")
+    print("  op ls                 open work packages")
+    print("  op mine               assigned to you")
+    print("  op new \"Something\"    create one")
+    print("  op help               everything else")
 
 
 def cmd_config_show(args):
@@ -1168,8 +1335,9 @@ QUICKSTART = """\
 op - OpenProject from the command line
 
 Setup
-  op init                                connect to your instance
-  op config set --project scrum          stop typing --project every time
+  op setup                               guided setup: URL, token, default
+                                         project, PATH and tab completion
+  op config set --project scrum          change the default project later
 
 Look
   op ls                                  open work packages
@@ -1268,9 +1436,15 @@ def build_parser():
     add_common(p)
     sub = p.add_subparsers(dest="cmd")
 
-    s = sub.add_parser("init", help="connect to an instance")
-    s.add_argument("--url"); s.add_argument("--token")
-    s.set_defaults(func=cmd_init, offline=True)
+    s = sub.add_parser("setup", aliases=["init"], help="guided first-time setup")
+    s.add_argument("--url", help="instance URL, to skip the prompt")
+    s.add_argument("--token", help="API token, to skip the prompt")
+    s.add_argument("--project", help="default project, to skip the prompt")
+    s.add_argument("--yes", "-y", action="store_true",
+                   help="accept every default; needs --url and --token")
+    s.add_argument("--skip-shell", action="store_true", dest="skip_shell",
+                   help="do not touch PATH or shell profiles")
+    s.set_defaults(func=cmd_setup, offline=True)
 
     s = sub.add_parser("config", help="show or change configuration")
     csub = s.add_subparsers(dest="subcmd")

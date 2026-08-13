@@ -12,12 +12,35 @@ op close 43 44 45
 ## Setup
 
 ```bash
-op init                              # asks, verifies, saves to ~/.openproject/config.json
-op config set --project scrum        # stop typing --project
-op completion powershell >> $PROFILE # tab completion
+op setup
 ```
 
-Credentials resolve as: flags → `OP_URL` / `OP_TOKEN` → `~/.openproject/config.json`.
+A guided wizard that walks through four steps:
+
+1. **Instance** — checks that an OpenProject API actually answers at the URL
+   before asking for anything else, so a typo fails immediately rather than
+   as a confusing 401 later.
+2. **Token** — offers to open `/my/access_token` in your browser, then
+   verifies the token by fetching your account and showing who you are.
+3. **Default project** — lists your projects and lets you pick one by number.
+   Every `ls`, `new`, `stats` and `types` then uses it.
+4. **Shell integration** — optionally adds this directory to your `PATH` and
+   installs tab completion into your shell profile. Both are skippable and
+   both are idempotent, so re-running is safe.
+
+Unattended, for provisioning:
+
+```bash
+op setup --url https://openproject.example.com \
+         --token "$OP_TOKEN" --project scrum --yes --skip-shell
+```
+
+`--yes` accepts each step's *default* rather than blindly answering yes, so an
+unreachable URL still stops setup instead of being written to the config.
+
+Re-run `op setup` any time to reconfigure; it offers to keep the existing
+token. Credentials resolve as: flags → `OP_URL` / `OP_TOKEN` →
+`~/.openproject/config.json` (written `0600`).
 
 ## What makes it easy
 
