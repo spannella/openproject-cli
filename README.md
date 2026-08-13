@@ -153,4 +153,4 @@ should work with 10 and later.
 
 ## License
 
-MIT
+[MIT](LICENSE)
