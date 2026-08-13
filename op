@@ -1,0 +1,4 @@
+#!/bin/sh
+# POSIX launcher for the op CLI.
+# Put this directory on your PATH to run `op` from anywhere.
+exec python3 "$(dirname "$0")/op.py" "$@"

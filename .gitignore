@@ -1,0 +1,16 @@
+# Never commit credentials or cached instance data.
+config.json
+cache.json
+.openproject/
+*.token
+.env
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

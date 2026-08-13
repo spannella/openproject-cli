@@ -1,0 +1,10 @@
+# The POSIX launcher and the Python entry point must keep LF endings, or they
+# fail with "bad interpreter" when checked out on Linux or macOS.
+* text=auto eol=lf
+op    text eol=lf
+*.py  text eol=lf
+*.sh  text eol=lf
+
+# Windows batch files need CRLF.
+*.cmd text eol=crlf
+*.bat text eol=crlf
