@@ -38,9 +38,46 @@ op setup --url https://openproject.example.com \
 `--yes` accepts each step's *default* rather than blindly answering yes, so an
 unreachable URL still stops setup instead of being written to the config.
 
-Re-run `op setup` any time to reconfigure; it offers to keep the existing
-token. Credentials resolve as: flags → `OP_URL` / `OP_TOKEN` →
-`~/.openproject/config.json` (written `0600`).
+Re-run `op setup` any time to reconfigure; it offers to keep the existing token.
+
+## The config file
+
+Settings live in `~/.openproject/config.json` (written `0600`). It is plain
+JSON and safe to edit by hand:
+
+```jsonc
+{
+  "url":            "https://openproject.example.com",
+  "token":          "opapi-...",
+  "defaultProject": "scrum",   // used when --project is omitted
+  "defaultType":    "Task",    // used by `op new` when --type is omitted
+  "defaultLimit":   100,       // used when --limit is omitted
+  "cacheTtl":       600,       // seconds to cache lookup tables; 0 disables
+  "timeout":        90,        // HTTP timeout in seconds
+  "color":          "auto"     // auto, always or never
+}
+```
+
+| Command | |
+|---|---|
+| `op config` | every setting, its value, and where it came from |
+| `op config path` | print the file path, e.g. `code $(op config path)` |
+| `op config edit` | open it in `$EDITOR` (creates it first if missing) |
+| `op config set <name> <value>` | change one setting |
+| `op config set <name>` | clear one setting |
+
+Values are validated on write and on read, so a typo tells you rather than
+failing strangely later:
+
+```
+$ op config set defaultProjekt scrum
+op: unknown setting 'defaultProjekt'
+    Did you mean: defaultProject, defaultType, defaultLimit?
+```
+
+Each setting resolves as **flag → environment → config file → built-in
+default**. `OP_URL`, `OP_TOKEN`, `OP_PROJECT` and `OP_COLOR` override the file,
+which is handy in CI without writing anything to disk.
 
 ## What makes it easy
 

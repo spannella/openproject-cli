@@ -149,10 +149,69 @@ def save_config(cfg):
         pass
 
 
+# Everything the config file understands. Keeping it declarative means
+# `op config` can document itself and `op config set` can validate.
+SETTINGS = {
+    "url":            dict(type=str, default=None, env="OP_URL",
+                           desc="instance base URL"),
+    "token":          dict(type=str, default=None, env="OP_TOKEN", secret=True,
+                           desc="API token"),
+    "defaultProject": dict(type=str, default=None, env="OP_PROJECT",
+                           desc="project used when --project is omitted"),
+    "defaultType":    dict(type=str, default="Task", env=None,
+                           desc="type used by `op new` when --type is omitted"),
+    "defaultLimit":   dict(type=int, default=None, env=None,
+                           desc="max records when --limit is omitted"),
+    "cacheTtl":       dict(type=int, default=600, env=None,
+                           desc="seconds to cache lookup tables (0 disables)"),
+    "timeout":        dict(type=int, default=90, env=None,
+                           desc="HTTP timeout in seconds"),
+    "color":          dict(type=str, default="auto", env="OP_COLOR",
+                           desc="auto, always or never"),
+}
+
+_CONFIG_CACHE = None
+
+
+def config():
+    global _CONFIG_CACHE
+    if _CONFIG_CACHE is None:
+        _CONFIG_CACHE = load_config()
+        unknown = [k for k in _CONFIG_CACHE if k not in SETTINGS]
+        if unknown:
+            note(paint(f"op: ignoring unknown setting(s) in {CONFIG_PATH}: "
+                       f"{', '.join(unknown)}", C.YELLOW))
+    return _CONFIG_CACHE
+
+
+def setting(name):
+    spec = SETTINGS[name]
+    env = spec.get("env")
+    if env and os.environ.get(env):
+        raw = os.environ[env]
+    elif config().get(name) is not None:
+        raw = config()[name]
+    else:
+        return spec["default"]
+    try:
+        return spec["type"](raw)
+    except (TypeError, ValueError):
+        die(f"setting {name!r} should be a {spec['type'].__name__}, got {raw!r}",
+            hint=f"Fix it in {CONFIG_PATH}")
+
+
+def setting_source(name):
+    spec = SETTINGS[name]
+    if spec.get("env") and os.environ.get(spec["env"]):
+        return f"env {spec['env']}"
+    if config().get(name) is not None:
+        return "config file"
+    return "default"
+
+
 def resolve_credentials(args):
-    cfg = load_config()
-    url = getattr(args, "url", None) or os.environ.get("OP_URL") or cfg.get("url")
-    token = getattr(args, "token", None) or os.environ.get("OP_TOKEN") or cfg.get("token")
+    url = getattr(args, "url", None) or setting("url")
+    token = getattr(args, "token", None) or setting("token")
     if not url or not token:
         die("not configured yet", hint="Run:  op setup")
     return url.rstrip("/"), token
@@ -169,9 +228,10 @@ class Cache:
 
     def __init__(self, base_url, enabled=True):
         self.base = base_url
-        self.enabled = enabled
+        self.ttl = setting("cacheTtl")
+        self.enabled = enabled and self.ttl > 0
         self.data = {}
-        if enabled and CACHE_PATH.exists():
+        if self.enabled and CACHE_PATH.exists():
             try:
                 self.data = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
@@ -186,7 +246,7 @@ class Cache:
         entry = self.data.get(self._key(name))
         if not entry:
             return None
-        if time.time() - entry.get("at", 0) > CACHE_TTL:
+        if time.time() - entry.get("at", 0) > self.ttl:
             return None
         return entry.get("value")
 
@@ -764,34 +824,94 @@ def cmd_setup(args):
     print("  op help               everything else")
 
 
+def _mask(name, value):
+    if value and SETTINGS.get(name, {}).get("secret"):
+        return str(value)[:14] + "..."
+    return value
+
+
 def cmd_config_show(args):
-    cfg = load_config()
-    tok = getattr(args, "token", None) or os.environ.get("OP_TOKEN") or cfg.get("token")
-    output(args, {
-        "url": getattr(args, "url", None) or os.environ.get("OP_URL") or cfg.get("url"),
-        "token": (tok[:14] + "...") if tok else None,
-        "defaultProject": cfg.get("defaultProject"),
-        "configFile": str(CONFIG_PATH),
-        "cacheFile": str(CACHE_PATH) if CACHE_PATH.exists() else "(none)",
-    }, title="Configuration")
+    rows = [{"setting": name,
+             "value": _mask(name, setting(name)),
+             "source": setting_source(name),
+             "what": SETTINGS[name]["desc"]}
+            for name in SETTINGS]
+    if want_json(args):
+        print(json.dumps({"file": str(CONFIG_PATH),
+                          "exists": CONFIG_PATH.exists(),
+                          "settings": {r["setting"]: r["value"] for r in rows},
+                          "sources": {r["setting"]: r["source"] for r in rows}},
+                         indent=2, default=str))
+        return
+    print(paint(f"Config file: {CONFIG_PATH}"
+                + ("" if CONFIG_PATH.exists() else "  (not created yet)"), C.BOLD))
+    print_table(rows, ["setting", "value", "source", "what"])
+    print(paint("\nEdit it directly with `op config edit`, or set one value with"
+                "\n  op config set <setting> <value>", C.DIM))
+
+
+def cmd_config_path(args):
+    print(CONFIG_PATH)
+
+
+def cmd_config_edit(args):
+    if not CONFIG_PATH.exists():
+        save_config({k: v for k, v in ((n, setting(n)) for n in SETTINGS) if v is not None})
+        note(f"created {CONFIG_PATH}")
+    editor = args.editor or os.environ.get("OP_EDITOR") or os.environ.get("EDITOR") \
+        or os.environ.get("VISUAL")
+    if editor:
+        os.system(f'{editor} "{CONFIG_PATH}"')
+        return
+    if os.name == "nt":
+        os.startfile(str(CONFIG_PATH))  # noqa: S606 - opens the user's default editor
+        note(f"opened {CONFIG_PATH}")
+    else:
+        die("no editor found", hint="Set $EDITOR, or edit " + str(CONFIG_PATH))
 
 
 def cmd_config_set(args):
     cfg = load_config()
     changed = []
-    if args.url:
-        cfg["url"] = args.url.rstrip("/"); changed.append("url")
-    if args.token:
-        cfg["token"] = args.token; changed.append("token")
-    if args.project:
-        cfg["defaultProject"] = args.project; changed.append("defaultProject")
-    if args.clear_project:
-        cfg.pop("defaultProject", None); changed.append("defaultProject (cleared)")
+
+    # Named convenience flags.
+    for flag, key in (("url", "url"), ("token", "token"), ("project", "defaultProject")):
+        val = getattr(args, flag, None)
+        if val:
+            cfg[key] = val.rstrip("/") if key == "url" else val
+            changed.append(key)
+    if getattr(args, "clear_project", False):
+        cfg.pop("defaultProject", None)
+        changed.append("defaultProject (cleared)")
+
+    # Generic  op config set <setting> <value>
+    if args.setting:
+        name = args.setting
+        if name not in SETTINGS:
+            close = difflib.get_close_matches(name, list(SETTINGS), n=3, cutoff=0.4)
+            die(f"unknown setting {name!r}", 1,
+                (f"Did you mean: {', '.join(close)}?" if close
+                 else "Known settings: " + ", ".join(SETTINGS)))
+        if args.value is None or args.value == "":
+            cfg.pop(name, None)
+            changed.append(f"{name} (cleared)")
+        else:
+            spec = SETTINGS[name]
+            try:
+                cfg[name] = spec["type"](args.value)
+            except (TypeError, ValueError):
+                die(f"{name} must be a {spec['type'].__name__}, got {args.value!r}")
+            if name == "color" and cfg[name] not in ("auto", "always", "never"):
+                die("color must be auto, always or never")
+            changed.append(name)
+
     if not changed:
-        die("nothing to set",
-            hint="Try:  op config set --project scrum")
+        die("nothing to set", hint="Try:  op config set defaultProject scrum"
+                                   "\n      op config set --project scrum")
     save_config(cfg)
-    note("Updated: " + ", ".join(changed))
+    global _CONFIG_CACHE
+    _CONFIG_CACHE = None
+    note(paint("Updated: " + ", ".join(changed), C.GREEN))
     cmd_config_show(args)
 
 
@@ -834,7 +954,7 @@ def default_project(args):
     raw = getattr(args, "project", None)
     if raw is not None:
         return None if str(raw).strip().lower() in NO_PROJECT else raw
-    return load_config().get("defaultProject")
+    return setting("defaultProject")
 
 
 def _filters(args, r, project_required=False):
@@ -940,7 +1060,7 @@ def cmd_new(args, c, r):
         die("which project?",
             hint="Add --project <name>, or set a default: op config set --project <name>")
     project_id = r.project(proj)
-    type_id = r.type(args.type or "Task", project_id)
+    type_id = r.type(args.type or setting("defaultType"), project_id)
     body = {"subject": args.subject,
             "_links": {"project": {"href": f"/api/v3/projects/{project_id}"},
                        "type": {"href": f"/api/v3/types/{type_id}"}}}
@@ -1388,6 +1508,8 @@ COMMON = [
     (("--limit",), {"type": int, "help": "maximum records"}),
     (("--no-cache",), {"action": "store_true", "dest": "no_cache",
                        "help": "bypass the lookup cache"}),
+    (("--color",), {"choices": ["auto", "always", "never"],
+                    "help": "colour output (default auto)"}),
     (("--url",), {"help": "override the configured URL"}),
     (("--token",), {"help": "override the configured token"}),
     (("-v", "--verbose"), {"action": "store_true", "help": "log requests to stderr"}),
@@ -1448,13 +1570,20 @@ def build_parser():
 
     s = sub.add_parser("config", help="show or change configuration")
     csub = s.add_subparsers(dest="subcmd")
-    cs = csub.add_parser("set", help="save a setting")
+    cs = csub.add_parser("set", help="change a setting")
+    cs.add_argument("setting", nargs="?", help="setting name, e.g. defaultProject")
+    cs.add_argument("value", nargs="?", help="new value; omit to clear it")
     cs.add_argument("--url"); cs.add_argument("--token")
-    cs.add_argument("--project", help="default project for ls/new/types")
+    cs.add_argument("--project", help="shorthand for defaultProject")
     cs.add_argument("--clear-project", action="store_true", dest="clear_project")
     cs.set_defaults(func=cmd_config_set, offline=True)
-    csub.add_parser("show", help="show configuration").set_defaults(
+    csub.add_parser("show", help="show every setting and where it came from").set_defaults(
         func=cmd_config_show, offline=True)
+    csub.add_parser("path", help="print the config file path").set_defaults(
+        func=cmd_config_path, offline=True)
+    ce = csub.add_parser("edit", help="open the config file in your editor")
+    ce.add_argument("--editor", help="editor command (default $EDITOR)")
+    ce.set_defaults(func=cmd_config_edit, offline=True)
     s.set_defaults(func=cmd_config_show, offline=True)
 
     s = sub.add_parser("cache", help="inspect or clear the lookup cache")
@@ -1586,16 +1715,30 @@ def main():
 
     for attr, default in (("full", False), ("table", False), ("json", False),
                           ("limit", None), ("verbose", False), ("no_cache", False),
-                          ("columns", None)):
+                          ("columns", None), ("color", None)):
         if not hasattr(args, attr):
             setattr(args, attr, default)
+
+    # Colour: flag beats config beats "auto".
+    global USE_COLOR
+    mode = (args.color or setting("color") or "auto").lower()
+    if mode == "always":
+        USE_COLOR = True
+    elif mode == "never":
+        USE_COLOR = False
+    else:
+        USE_COLOR = IS_TTY and not os.environ.get("NO_COLOR") \
+            and os.environ.get("TERM") != "dumb"
+
+    if args.limit is None:
+        args.limit = setting("defaultLimit")
 
     if getattr(args, "offline", False):
         args.func(args)
         return
 
     url, token = resolve_credentials(args)
-    client = Client(url, token, verbose=args.verbose)
+    client = Client(url, token, verbose=args.verbose, timeout=setting("timeout"))
     resolver = Resolver(client, Cache(url, enabled=not args.no_cache))
     args.func(args, client, resolver)
     if args.verbose:
